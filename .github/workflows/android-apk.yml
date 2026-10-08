@@ -43,12 +43,15 @@ jobs:
         env:
           KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_B64 }}
         run: |
-          test -n "$KEYSTORE_B64"
-          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/granth-upload.jks"
-          echo "RELEASE_STORE_FILE=$RUNNER_TEMP/granth-upload.jks" >> "$GITHUB_ENV"
-          echo "RELEASE_STORE_PASSWORD=${{ secrets.RELEASE_STORE_PASSWORD }}" >> "$GITHUB_ENV"
-          echo "RELEASE_KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}" >> "$GITHUB_ENV"
-          echo "RELEASE_KEY_PASSWORD=${{ secrets.RELEASE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/granth-upload.jks"
+            echo "RELEASE_STORE_FILE=$RUNNER_TEMP/granth-upload.jks" >> "$GITHUB_ENV"
+            echo "RELEASE_STORE_PASSWORD=${{ secrets.RELEASE_STORE_PASSWORD }}" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_ALIAS=${{ secrets.RELEASE_KEY_ALIAS }}" >> "$GITHUB_ENV"
+            echo "RELEASE_KEY_PASSWORD=${{ secrets.RELEASE_KEY_PASSWORD }}" >> "$GITHUB_ENV"
+          else
+            echo "Upload key secret is not set. This build is signed with the debug key, not the Play upload key."
+          fi
 
       - name: Build signed APK and AAB
         working-directory: android
