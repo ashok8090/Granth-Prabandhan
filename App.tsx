@@ -1,10 +1,10 @@
-import { cacheDirectory, documentDirectory, EncodingType, getContentUriAsync, getInfoAsync, makeDirectoryAsync, writeAsStringAsync } from "expo-file-system/legacy";
+import { cacheDirectory, deleteAsync, documentDirectory, EncodingType, getContentUriAsync, getInfoAsync, makeDirectoryAsync, writeAsStringAsync } from "expo-file-system/legacy";
 import * as IntentLauncher from "expo-intent-launcher";
 import * as MediaLibrary from "expo-media-library";
 import * as Sharing from "expo-sharing";
 import { StatusBar } from "expo-status-bar";
 import { useEffect, useRef, useState } from "react";
-import { AppState, BackHandler, Image, Linking, NativeModules, Share, StyleSheet, View } from "react-native";
+import { AppState, BackHandler, Image, Linking, NativeModules, PermissionsAndroid, Platform, Share, StyleSheet, View } from "react-native";
 import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
 
@@ -120,6 +120,12 @@ function Shell() {
     return () => clearTimeout(timer);
   }, []);
   useEffect(() => {
+    const timer = setTimeout(() => {
+      void askDevicePermissions();
+    }, 2800);
+    return () => clearTimeout(timer);
+  }, []);
+  useEffect(() => {
     const onBack = () => {
       web.current?.injectJavaScript(
         "if(window.__granthBack){window.__granthBack();}true;",
@@ -213,6 +219,18 @@ function Shell() {
       ) : null}
     </View>
   );
+}
+
+async function askDevicePermissions() {
+  if (Platform.OS !== "android") return;
+  const names: Array<(typeof PermissionsAndroid.PERMISSIONS)[keyof typeof PermissionsAndroid.PERMISSIONS]> = [];
+  if (Number(Platform.Version) >= 33) {
+    names.push(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS, PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES);
+  } else {
+    names.push(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE, PermissionsAndroid.PERMISSIONS.WRITE_EXTERNAL_STORAGE);
+  }
+  await PermissionsAndroid.requestMultiple(names).catch(() => undefined);
+  await MediaLibrary.requestPermissionsAsync(false, ["photo"]).catch(() => undefined);
 }
 
 function hashFromShareUrl(url: string) {
@@ -387,7 +405,8 @@ async function shareSaved(rawName: string, view: WebView | null) {
   const name = safeName(rawName);
   const uri = documentDirectory ? `${documentDirectory}Granth/${name}` : "";
   const info = uri ? await getInfoAsync(uri).catch(() => null) : null;
-  const ready = Boolean(info && "exists" in info && info.exists);
+  const size = info && "exists" in info && info.exists && "size" in info ? Number(info.size) : 0;
+  const ready = size > 64;
   view?.injectJavaScript(
     `window.__granthShare${ready ? "Hit" : "Miss"}&&window.__granthShare${ready ? "Hit" : "Miss"}(${JSON.stringify(rawName)});true;`,
   );
@@ -411,7 +430,7 @@ async function openSaved(rawName: string, view: WebView | null) {
   const uri = documentDirectory ? `${documentDirectory}Granth/${name}` : "";
   if (uri) {
     const info = await getInfoAsync(uri).catch(() => null);
-    if (info && "exists" in info && info.exists) {
+    if (info && "exists" in info && info.exists && "size" in info && Number(info.size) > 64) {
       await viewPdf(uri);
       return;
     }
@@ -423,10 +442,10 @@ async function placeFile(message: SaveChunk, parts: Map<string, string[]>) {
   const bucket = parts.get(message.id) ?? [];
   bucket[message.index] = message.data;
   parts.set(message.id, bucket);
-  if (bucket.filter((part) => part != null).length < message.total) return;
+  if (bucket.filter((part) => part != null && part.length > 0).length < message.total) return;
   parts.delete(message.id);
   const name = safeName(message.name);
-  const job = writeFile(message, name, bucket.join(""));
+  const job = writeFile(message, name, bucket);
   writing.set(name, job);
   try {
     await job;
@@ -435,7 +454,7 @@ async function placeFile(message: SaveChunk, parts: Map<string, string[]>) {
   }
 }
 
-async function writeFile(message: SaveChunk, name: string, data: string) {
+async function writeFile(message: SaveChunk, name: string, chunks: string[]) {
   const pdf = (message.mime || "").includes("pdf") || name.toLowerCase().endsWith(".pdf");
   const root = pdf ? documentDirectory || cacheDirectory : cacheDirectory;
   if (!root) return "";
@@ -443,11 +462,36 @@ async function writeFile(message: SaveChunk, name: string, data: string) {
     await makeDirectoryAsync(`${documentDirectory}Granth`, { intermediates: true }).catch(() => undefined);
   }
   const uri = pdf && documentDirectory ? `${documentDirectory}Granth/${name}` : `${root}${name}`;
-  await writeAsStringAsync(uri, data, { encoding: EncodingType.Base64 });
+  const writer = NativeModules.GranthDownloads as {
+    beginWrite?: (path: string) => Promise<boolean>;
+    appendWrite?: (path: string, data: string) => Promise<number>;
+    finishWrite?: (path: string) => Promise<number>;
+    copyToDownloads?: (path: string, name: string, mime: string) => Promise<string>;
+  } | undefined;
+  try {
+    if (writer?.beginWrite && writer.appendWrite && writer.finishWrite) {
+      await writer.beginWrite(uri);
+      let expect = 0;
+      for (const part of chunks) {
+        if (!part) throw new Error("missing chunk");
+        const pad = part.endsWith("==") ? 2 : part.endsWith("=") ? 1 : 0;
+        expect += Math.floor((part.length * 3) / 4) - pad;
+        await writer.appendWrite(uri, part);
+      }
+      const size = await writer.finishWrite(uri);
+      if (!size || size < 64 || size + 8 < expect) throw new Error("short file");
+    } else {
+      await writeAsStringAsync(uri, chunks.join(""), { encoding: EncodingType.Base64 });
+      const info = await getInfoAsync(uri);
+      if (!info.exists || !("size" in info) || Number(info.size) < 64) throw new Error("empty file");
+    }
+  } catch (error) {
+    await deleteAsync(uri, { idempotent: true }).catch(() => undefined);
+    throw error;
+  }
   if (pdf) {
-    const copier = NativeModules.GranthDownloads as { copyToDownloads?: (path: string, name: string, mime: string) => Promise<string> } | undefined;
-    if (copier?.copyToDownloads && message.type === "save-chunk") {
-      await copier.copyToDownloads(uri, name, "application/pdf").catch(() => undefined);
+    if (writer?.copyToDownloads && message.type === "save-chunk") {
+      await writer.copyToDownloads(uri, name, "application/pdf").catch(() => undefined);
     }
   }
   if (message.type === "share-chunk") {
